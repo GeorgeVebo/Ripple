@@ -79,7 +79,11 @@ try:
                 if gesture.score >= 0.6:
                     if gesture.category_name == "Open_Palm":
                         servo_command = "H"
-                    elif gesture.category_name == "Closed_Fist":
+                    elif (
+                        gesture.category_name == "Closed_Fist"
+                        or gesture.category_name == "Thumbs_Up"
+                        or gesture.category_name == "Thumbs_Down"
+                    ):
                         servo_command = "L"
 
             # Require a stable gesture before changing the servo target.

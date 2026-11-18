@@ -8,6 +8,7 @@ Servo motor;
 const byte SERVO_PIN = 9;
 const int CLOSE_PULSE = 180;
 const int OPEN_PULSE = 20;
+bool servoClosed = true;  // Servo starts at 180 degrees
 
 // ---------- CoreXY motor pins ----------
 const byte A_PUL = 2;
@@ -56,9 +57,11 @@ void setup() {
 bool handleServoCommand(char command) {
   if (command == 'H') {
     motor.write(OPEN_PULSE);
+    servoClosed = false;
     return true;
   }
   else if (command == 'L') {
+    servoClosed = true;
     motor.write(CLOSE_PULSE);
     return true;
   }
@@ -99,9 +102,15 @@ void loop() {
   }
 }
 
+
 void processCommand(char *text) {
   char *end;
   double dx = strtod(text, &end);
+
+  if (servoClosed) {
+    Serial.println("Stopped; movement incomplete.");
+    return;
+  }
 
   if (end == text) {
     Serial.println("Enter two numbers, e.g. 5 -5");
@@ -139,24 +148,29 @@ void processCommand(char *text) {
   }
 }
 
+
 // Called throughout a gantry movement.
 // Servo commands are accepted; S stops the gantry.
 // Other input is discarded until the move finishes.
 bool stopRequested() {
-  bool stop = false;
+  // Latch a stop even if H arrives immediately after L.
+  bool stop = servoClosed;
 
   while (Serial.available() > 0) {
     char c = Serial.read();
 
-    if (handleServoCommand(c)) continue;
+    if (handleServoCommand(c)) {
+      if (servoClosed) stop = true;
+      continue;
+    }
 
     if (c == 'S' || c == 's') {
       stop = true;
     }
   }
-
   return stop;
 }
+
 
 bool moveCoreXY(long aSteps, long bSteps) {
   digitalWrite(A_DIR, (aSteps >= 0) ^ INVERT_A);
@@ -200,7 +214,6 @@ bool moveCoreXY(long aSteps, long bSteps) {
     digitalWrite(A_PUL, HIGH);
     digitalWrite(B_PUL, HIGH);
   }
-
   return true;
 }
 
