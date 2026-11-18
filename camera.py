@@ -5,6 +5,7 @@ import cv2
 import mediapipe as mp
 
 import serial
+import numpy as np
 
 arduino = serial.Serial(
     "/dev/cu.usbmodem101",  # Replace with the port shown in Arduino IDE → Tools → Port.
@@ -40,6 +41,52 @@ options = mp.tasks.vision.GestureRecognizerOptions(
     num_hands=1,
 )
 
+
+# Open palm detection code block
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+def joint_angle(a, b, c):
+    """Angle at landmark b, in degrees."""
+    ba = a - b
+    bc = c - b
+
+    denominator = np.linalg.norm(ba) * np.linalg.norm(bc)
+    if denominator < 1e-8:
+        return 0.0
+
+    cosine = np.dot(ba, bc) / denominator
+    return np.degrees(np.arccos(np.clip(cosine, -1.0, 1.0)))
+
+
+def is_open_hand(landmarks):
+    # Use image pixel proportions so x/y have the same scale.
+    points = np.array([
+        [point.x * width, point.y * height]
+        for point in landmarks
+    ])
+
+    # MCP, PIP, DIP, TIP for the four fingers.
+    fingers = [
+        (5, 6, 7, 8),      # Index
+        (9, 10, 11, 12),   # Middle
+        (13, 14, 15, 16),  # Ring
+        (17, 18, 19, 20),  # Pinky
+    ]
+
+    for mcp, pip, dip, tip in fingers:
+        pip_angle = joint_angle(
+            points[mcp], points[pip], points[dip]
+        )
+        dip_angle = joint_angle(
+            points[pip], points[dip], points[tip]
+        )
+
+        if pip_angle < 155 or dip_angle < 150:
+            return False
+
+    return True
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+
 camera = cv2.VideoCapture(0)
 
 try:
@@ -71,20 +118,41 @@ try:
 
 
             # Servo motor code block
-            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            height, width = frame.shape[:2]
             servo_command = None
-            if result.gestures and result.gestures[0]:
-                gesture = result.gestures[0][0]
 
-                if gesture.score >= 0.6:
-                    if gesture.category_name == "Open_Palm":
-                        servo_command = "H"
-                    elif (
-                        gesture.category_name == "Closed_Fist"
-                        or gesture.category_name == "Thumbs_Up"
-                        or gesture.category_name == "Thumbs_Down"
+            if result.hand_landmarks:
+                hand = result.hand_landmarks[0]
+
+                if is_open_hand(hand):
+                    servo_command = "H"  # Open servo
+                elif result.gestures and result.gestures[0]:
+                    gesture = result.gestures[0][0]
+
+                    if (
+                        gesture.score >= 0.6
+                        and gesture.category_name in (
+                            "Closed_Fist",
+                            "Thumb_Up",
+                            "Thumb_Down",
+                        )
                     ):
-                        servo_command = "L"
+                        servo_command = "L"  # Close servo
+
+
+            # if result.gestures and result.gestures[0]:
+            #     gesture = result.gestures[0][0]
+
+            #     if gesture.score >= 0.6:
+            #         if gesture.category_name == "Open_Palm":
+            #             servo_command = "H"
+            #         elif (
+            #             gesture.category_name == "Closed_Fist"
+            #             or gesture.category_name == "Thumbs_Up"
+            #             or gesture.category_name == "Thumbs_Down"
+            #         ):
+            #             servo_command = "L"
 
             # Require a stable gesture before changing the servo target.
             now = time.monotonic()
@@ -100,12 +168,12 @@ try:
             ):
                 arduino.write((candidate_command + "\n").encode())
                 last_servo_command = candidate_command
-            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
 
             # Nema 23 motors code block
-            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
             # Read Arduino responses without blocking the camera.
             if arduino.in_waiting:
                 serial_buffer += arduino.read(
@@ -146,7 +214,7 @@ try:
                     arduino.write(command.encode())
                     busy = True
                     stop_sent = False
-            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+            # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
             label = "No hand"
