@@ -5,18 +5,71 @@ import cv2
 import mediapipe as mp
 
 import serial
+from serial.tools import list_ports
 import numpy as np
 
-arduino = serial.Serial(
-    "/dev/cu.usbmodem101",  # Replace with the port shown in Arduino IDE → Tools → Port.
-    9600,
-    timeout=0,
-    write_timeout=0.12
-)
+arduino = None
+arduino_status = "Arduino: not detected"
 
-# Opening the port usually resets the Uno.
-time.sleep(2)
-arduino.reset_input_buffer()
+
+def find_arduino_port(ports):
+    mac_ports = [port for port in ports if port.device.startswith("/dev/cu.")]
+    candidates = mac_ports or list(ports)
+    arduino_ports = []
+
+    for port in candidates:
+        description = " ".join(
+            value or ""
+            for value in (port.description, port.manufacturer, port.product)
+        ).lower()
+        if port.vid in (0x2341, 0x2A03) or "arduino" in description:
+            arduino_ports.append(port)
+
+    if len(arduino_ports) == 1:
+        return arduino_ports[0]
+    if arduino_ports:
+        return None
+
+    usb_serial_markers = (
+        "usbmodem",
+        "usbserial",
+        "wchusbserial",
+        "slab_usbtouart",
+        "usbtouart",
+    )
+    usb_serial_ports = [
+        port for port in candidates
+        if any(marker in port.device.lower() for marker in usb_serial_markers)
+    ]
+    return usb_serial_ports[0] if len(usb_serial_ports) == 1 else None
+
+
+serial_ports = list(list_ports.comports())
+arduino_port = find_arduino_port(serial_ports)
+if arduino_port is None:
+    available_ports = ", ".join(port.device for port in serial_ports) or "none"
+    print(f"Arduino not detected. Available serial ports: {available_ports}")
+else:
+    try:
+        arduino = serial.Serial(
+            arduino_port.device,
+            9600,
+            timeout=0,
+            write_timeout=0.12,
+        )
+
+        # Opening the port usually resets the Uno.
+        time.sleep(2)
+        arduino.reset_input_buffer()
+    except serial.SerialException as exc:
+        if arduino is not None and arduino.is_open:
+            arduino.close()
+        arduino = None
+        arduino_status = "Arduino: found but connection failed"
+        print(f"Could not connect to Arduino on {arduino_port.device}: {exc}")
+    else:
+        arduino_status = f"Arduino: connected ({arduino_port.device})"
+        print(arduino_status)
 
 busy = False
 stop_sent = False
@@ -29,7 +82,6 @@ last_servo_command = None
 candidate_command = None
 candidate_since = time.monotonic()
 GESTURE_HOLD_SECONDS = 0.15
-
 
 MODEL_PATH = Path(__file__).with_name("gesture_recognizer.task")
 
@@ -116,6 +168,7 @@ try:
             result = recognizer.recognize_for_video(image, timestamp)
             # !!!
 
+            height, width = frame.shape[:2]
 
             # Servo motor code block
             # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -156,7 +209,6 @@ try:
 
             # Require a stable gesture before changing the servo target.
             now = time.monotonic()
-
             if servo_command != candidate_command:
                 candidate_command = servo_command
                 candidate_since = now
@@ -165,6 +217,7 @@ try:
                 candidate_command is not None
                 and now - candidate_since >= GESTURE_HOLD_SECONDS
                 and candidate_command != last_servo_command
+                and arduino is not None
             ):
                 arduino.write((candidate_command + "\n").encode())
                 last_servo_command = candidate_command
@@ -174,46 +227,47 @@ try:
 
             # Nema 23 motors code block
             # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-            # Read Arduino responses without blocking the camera.
-            if arduino.in_waiting:
-                serial_buffer += arduino.read(
-                    arduino.in_waiting
-                ).decode(errors="ignore")
+            if arduino is not None:
+                # Read Arduino responses without blocking the camera.
+                if arduino.in_waiting:
+                    serial_buffer += arduino.read(
+                        arduino.in_waiting
+                    ).decode(errors="ignore")
 
-                while "\n" in serial_buffer:
-                    response, serial_buffer = serial_buffer.split("\n", 1)
-                    response = response.strip()
+                    while "\n" in serial_buffer:
+                        response, serial_buffer = serial_buffer.split("\n", 1)
+                        response = response.strip()
 
-                    if response in ("Done.", "Stopped; movement incomplete."):
-                        busy = False
+                        if response in ("Done.", "Stopped; movement incomplete."):
+                            busy = False
 
-            dx = 0.0
-            dy = 0.0
-            if result.hand_landmarks:
-                hand_point = result.hand_landmarks[0][9]
+                dx = 0.0
+                dy = 0.0
+                if result.hand_landmarks:
+                    hand_point = result.hand_landmarks[0][9]
 
-                # Normalized coordinates: center is approximately (0.5, 0.5).
-                offset_x = hand_point.x - 0.5
-                offset_y = 0.5 - hand_point.y  # Up becomes positive Y
+                    # Normalized coordinates: center is approximately (0.5, 0.5).
+                    offset_x = hand_point.x - 0.5
+                    offset_y = 0.5 - hand_point.y  # Up becomes positive Y
 
-                if abs(offset_x) > DEAD_ZONE:
-                    dx = MOVE_MM if offset_x > 0 else -MOVE_MM
+                    if abs(offset_x) > DEAD_ZONE:
+                        dx = MOVE_MM if offset_x > 0 else -MOVE_MM
 
-                if abs(offset_y) > DEAD_ZONE:
-                    dy = MOVE_MM if offset_y > 0 else -MOVE_MM
+                    if abs(offset_y) > DEAD_ZONE:
+                        dy = MOVE_MM if offset_y > 0 else -MOVE_MM
 
-            if dx == 0 and dy == 0:
-                # Stop an ongoing move when centered or no hand is detected.
-                if busy and not stop_sent:
-                    arduino.write(b"S\n")
-                    stop_sent = True
-            else:
-                # Send one small relative move, then wait for completion.
-                if not busy:
-                    command = f"{dx:.2f} {dy:.2f}\n"
-                    arduino.write(command.encode())
-                    busy = True
-                    stop_sent = False
+                if dx == 0 and dy == 0:
+                    # Stop an ongoing move when centered or no hand is detected.
+                    if busy and not stop_sent:
+                        arduino.write(b"S\n")
+                        stop_sent = True
+                else:
+                    # Send one small relative move, then wait for completion.
+                    if not busy:
+                        command = f"{dx:.2f} {dy:.2f}\n"
+                        arduino.write(command.encode())
+                        busy = True
+                        stop_sent = False
             # !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 
@@ -240,24 +294,22 @@ try:
                         )
 
                 hand = result.hand_landmarks[0]
-                index_tip = hand[9]  # Landmark 9 = middle finger bottom
-
-                x = int(index_tip.x * width / 10)
-                y = int(index_tip.y * height / 10)
-
-                cv2.putText(
-                    frame,
-                    f"Hand Position: ({x}, {y})",
-                    (20, 75),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    1, (0, 125, 255), 2
-                )
-            
 
             cv2.putText(
                 frame, label, (20, 40),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 1, (0, 125, 255), 2
+            )
+
+            status_color = (0, 255, 0) if arduino is not None else (0, 125, 255)
+            cv2.putText(
+                frame,
+                arduino_status,
+                (20, height - 20),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                status_color,
+                2,
             )
 
             cv2.imshow("Press Q to quit", frame)
@@ -267,10 +319,11 @@ try:
 
 finally:
     try:
-        if arduino.is_open:
+        if arduino is not None and arduino.is_open:
             arduino.write(b"S\n")
             arduino.flush()
     finally:
-        arduino.close()
+        if arduino is not None:
+            arduino.close()
         camera.release()
         cv2.destroyAllWindows()
